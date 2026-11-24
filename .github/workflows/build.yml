@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;27.2.12479018" > /dev/null
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Point cargo at the runner NDK
+        run: |
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          cat > .cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+          ar = "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
+          EOF
+
+      - name: Build
+        run: cargo build --target aarch64-linux-android --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miui_lights
+          path: target/aarch64-linux-android/release/miui_lights
