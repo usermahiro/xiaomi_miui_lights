@@ -15,10 +15,11 @@
 //! service simply mirrors the framework's brightness setting into
 //! /sys/class/leds/lcd-backlight/brightness.
 
-use std::io::Write;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rsbinder::Interface;
@@ -277,49 +278,143 @@ fn run_probe() -> Result<()> {
 
 // ---------------------------------------------------------------------- sync
 
-fn run_sync(panel: Panel, interval_ms: u64) -> Result<()> {
-    tracing::info!("[Sync] started (interval={}ms)", interval_ms);
-    let mut last_logged: i64 = i64::MIN;
-    let mut was_auto = -1;
+fn parse_brightness_event(line: &str) -> Option<f64> {
+    let marker = "BrightnessEvent: brt=";
+    let idx = line.find(marker)?;
+    let rest = &line[idx + marker.len()..];
+    let end = rest
+        .find(|c: char| c == '(' || c == ',' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let v: f64 = rest[..end].parse().ok()?;
+    if v.is_finite() {
+        Some(v.clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
 
-    loop {
-        if let Some(mode) = settings_get("screen_brightness_mode") {
-            let auto = if mode == "1" { 1 } else { 0 };
-            if auto != was_auto {
-                tracing::info!(
-                    "[Sync] screen_brightness_mode={} ({})",
-                    auto,
-                    if auto == 1 { "auto" } else { "manual" }
-                );
-                was_auto = auto;
-            }
-        }
+/// Stream the framework's applied brightness from logcat.
+///
+/// `DisplayManager`/`cmd display get-brightness` on this MIUI build only
+/// reports the *committed* value (updates on slider release). The
+/// DisplayPowerController keeps logging every applied value while the slider
+/// is dragged, so we follow those lines instead.
+fn spawn_logcat_brightness(tx: std::sync::mpsc::Sender<f64>) {
+    std::thread::spawn(move || loop {
+        let child = Command::new("/system/bin/logcat")
+            .args([
+                "-T",
+                "1",
+                "-v",
+                "brief",
+                "DisplayPowerController[0]:I",
+                "*:S",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
 
-        if let Some(level) = framework_brightness() {
-            let raw = panel.raw(level);
-            // Compare with the node itself: someone else (framework, HAL,
-            // another tool) may have changed it behind our back.
-            let current = read_i64(BACKLIGHT_NODE);
-            if current != Some(raw) {
-                match panel.write(raw) {
-                    Ok(()) => {
-                        if raw != last_logged {
-                            tracing::info!(
-                                "[Sync] brightness {:.3} -> raw {} (range {}..{})",
-                                level,
-                                raw,
-                                panel.min,
-                                panel.max
-                            );
-                            last_logged = raw;
+        match child {
+            Ok(mut child) => {
+                if let Some(out) = child.stdout.take() {
+                    for line in BufReader::new(out).lines().map_while(Result::ok) {
+                        if let Some(v) = parse_brightness_event(&line) {
+                            if tx.send(v).is_err() {
+                                return;
+                            }
                         }
                     }
-                    Err(e) => tracing::warn!("[Sync] write failed: {}", e),
+                }
+                let _ = child.wait();
+                tracing::warn!("[Sync] logcat stream ended, restarting");
+            }
+            Err(e) => tracing::warn!("[Sync] cannot start logcat: {}", e),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
+}
+
+fn run_sync(panel: Panel, interval_ms: u64) -> Result<()> {
+    tracing::info!("[Sync] started (idle tick={}ms, logcat realtime)", interval_ms);
+    let (tx, rx) = channel::<f64>();
+    spawn_logcat_brightness(tx);
+
+    let mut last_raw: i64 = i64::MIN;
+    let mut was_auto = -1;
+    // logcat is the realtime source; the cmd fallback is only a safety net
+    let fallback_every = Duration::from_secs(5);
+    let mut last_fallback = Instant::now() - fallback_every;
+
+    let mut apply = |level: f64, last_raw: &mut i64| {
+        let raw = panel.raw(level);
+        if raw == *last_raw {
+            return;
+        }
+        // What is on the node right now? Someone else may have changed it.
+        let current = read_i64(BACKLIGHT_NODE);
+        if current == Some(raw) {
+            *last_raw = raw;
+            return;
+        }
+        match panel.write(raw) {
+            Ok(()) => {
+                tracing::info!(
+                    "[Sync] brightness {:.4} -> raw {} (range {}..{})",
+                    level,
+                    raw,
+                    panel.min,
+                    panel.max
+                );
+                *last_raw = raw;
+            }
+            Err(e) => tracing::warn!("[Sync] write failed: {}", e),
+        }
+    };
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(interval_ms)) {
+            Ok(level) => apply(level, &mut last_raw),
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(mode) = settings_get("screen_brightness_mode") {
+                    let auto = if mode == "1" { 1 } else { 0 };
+                    if auto != was_auto {
+                        tracing::info!(
+                            "[Sync] screen_brightness_mode={} ({})",
+                            auto,
+                            if auto == 1 { "auto" } else { "manual" }
+                        );
+                        was_auto = auto;
+                    }
+                }
+                if last_fallback.elapsed() >= fallback_every {
+                    if let Some(level) = framework_brightness() {
+                        apply(level, &mut last_raw);
+                    }
+                    last_fallback = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::warn!("[Sync] logcat channel closed, restarting");
+                let (tx, rx2) = channel::<f64>();
+                spawn_logcat_brightness(tx);
+                let level = framework_brightness();
+                if let Some(level) = level {
+                    apply(level, &mut last_raw);
+                }
+                // continue with the new receiver
+                loop {
+                    match rx2.recv_timeout(Duration::from_millis(interval_ms)) {
+                        Ok(level) => apply(level, &mut last_raw),
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Some(level) = framework_brightness() {
+                                apply(level, &mut last_raw);
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             }
         }
-
-        std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }
 
@@ -349,7 +444,7 @@ fn main() {
         .try_init();
 
     let mut mode = "sync";
-    let mut interval_ms: u64 = 300;
+    let mut interval_ms: u64 = 1000;
     let mut gamma: f64 = std::env::var("MIUI_LIGHTS_GAMMA")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -361,7 +456,7 @@ fn main() {
     let mut gain: f64 = std::env::var("MIUI_LIGHTS_GAIN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2.2);
+        .unwrap_or(2.0);
     let mut value: Option<f64> = None;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -378,7 +473,7 @@ fn main() {
             }
             "--interval" => {
                 i += 1;
-                interval_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(300);
+                interval_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1000);
             }
             "--gamma" => {
                 i += 1;
@@ -390,7 +485,7 @@ fn main() {
             }
             "--gain" => {
                 i += 1;
-                gain = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(2.2);
+                gain = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(2.0);
             }
             "-h" | "--help" => usage(),
             other => {
