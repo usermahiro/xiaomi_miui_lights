@@ -1,0 +1,8 @@
+# Backlight bridge for MIUI/HyperOS ports.
+# Install to /vendor/etc/init/miui-lights.rc after reflash.
+service miui-lights /vendor/bin/miui_lights --sync
+    class late_start
+    user root
+    group root system
+    # optional: tune the curve here
+    #   --gamma 1.6 --interval 200

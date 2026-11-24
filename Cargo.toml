@@ -1,0 +1,28 @@
+[package]
+name = "miui-lights"
+version = "1.0.0"
+edition = "2021"
+description = "Backlight bridge + AIDL lights HAL for MIUI/HyperOS ports (MTK)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "miui_lights"
+path = "src/main.rs"
+
+[dependencies]
+rsbinder = { version = "=0.10.0", features = ["android_10_plus"] }
+anyhow = "=1.0"
+async-trait = "0.1"
+libc = "0.2"
+tracing = "=0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "=0.2"
+
+[build-dependencies]
+rsbinder-aidl = "=0.10.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
