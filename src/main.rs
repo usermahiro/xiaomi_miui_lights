@@ -278,12 +278,13 @@ fn run_probe() -> Result<()> {
 
 // ---------------------------------------------------------------------- sync
 
-fn parse_brightness_event(line: &str) -> Option<f64> {
-    let marker = "BrightnessEvent: brt=";
+fn parse_float_after<'a>(line: &'a str, marker: &str) -> Option<f64> {
     let idx = line.find(marker)?;
     let rest = &line[idx + marker.len()..];
+    let start = rest.find(|c: char| c.is_ascii_digit() || c == '.' || c == '-')?;
+    let rest = &rest[start..];
     let end = rest
-        .find(|c: char| c == '(' || c == ',' || c.is_whitespace())
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'E' || c == 'e' || c == '+'))
         .unwrap_or(rest.len());
     let v: f64 = rest[..end].parse().ok()?;
     if v.is_finite() {
@@ -291,6 +292,20 @@ fn parse_brightness_event(line: &str) -> Option<f64> {
     } else {
         None
     }
+}
+
+fn parse_brightness_event(line: &str) -> Option<f64> {
+    // Control Center drag: DisplayManagerService.setTemporaryBrightness
+    // (fires on every slider movement, ~10ms granularity)
+    if line.contains("setTemporaryBrightness") {
+        return parse_float_after(line, "brightness:");
+    }
+    // DPC impl: targetBrightness on every change, also during temporary drag
+    if line.contains("updateBrightnessChangeStatus") {
+        return parse_float_after(line, "targetBrightness:");
+    }
+    // Committed value (slider release, settings set, auto brightness, dim)
+    parse_float_after(line, "BrightnessEvent: brt=")
 }
 
 /// Stream the framework's applied brightness from logcat.
@@ -307,6 +322,8 @@ fn spawn_logcat_brightness(tx: std::sync::mpsc::Sender<f64>) {
                 "1",
                 "-v",
                 "brief",
+                "DisplayManagerService:V",
+                "DisplayPowerControllerImpl:V",
                 "DisplayPowerController[0]:I",
                 "*:S",
             ])

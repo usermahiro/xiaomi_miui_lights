@@ -13,11 +13,13 @@ langsung (`setLightState(0, color)` menulis sysfs dengan benar). Masalahnya cuma
 tidak ada yang memanggil. Karena itu solusinya dua lapis:
 
 1. **`--sync` (default)** — daemon yang mengikuti brightness realtime dari
-   log `DisplayPowerController[0]: BrightnessEvent: brt=...` (setiap gerakan
-   slider dicatat di situ, termasuk saat masih di-drag), lalu menulis ke sysfs
-   panel. Fallback tiap 5 detik: `cmd display get-brightness`. Di build MIUI ini
-   slider **tidak** memperbarui `screen_brightness_float`, jadi Settings hanya
-   fallback terakhir.
+   logcat, yaitu `DisplayManagerService: setTemporaryBrightness ... brightness:`
+   dan `DisplayPowerControllerImpl: ... targetBrightness:` (dipakai slider
+   Control Center, update tiap ~10ms saat drag), plus
+   `DisplayPowerController[0]: BrightnessEvent: brt=` untuk nilai final.
+   Fallback tiap 5 detik: `cmd display get-brightness`. Di build MIUI ini slider
+   **tidak** memperbarui `screen_brightness_float`, jadi Settings hanya fallback
+   terakhir.
 2. **`--hal`** — implementasi ulang `android.hardware.light.ILights/default`
    (AIDL V2) yang menulis sysfs. Dipakai kalau mau mengganti
    `vendor.light-default` bawaan di image.
