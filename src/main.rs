@@ -45,35 +45,40 @@ struct Panel {
     min: i64,
     max: i64,
     gamma: f64,
+    /// gain applied to the framework brightness (MIUI caps normal brightness
+    /// around 0.45-0.5 before HBM, so the raw float needs scaling)
+    gain: f64,
     /// minimum fraction of the range that is still visible on AMOLED
     floor: f64,
 }
 
 impl Panel {
-    fn detect(gamma: f64, floor: f64) -> Self {
+    fn detect(gamma: f64, floor: f64, gain: f64) -> Self {
         let max = read_i64(BACKLIGHT_MAX_HW)
             .or_else(|| read_i64(BACKLIGHT_MAX))
             .unwrap_or(255);
         let min = read_i64(BACKLIGHT_MIN_HW).unwrap_or(1).max(1);
         tracing::info!(
-            "[Panel] node={} range={}..{} gamma={} floor={}",
+            "[Panel] node={} range={}..{} gamma={} gain={} floor={}",
             BACKLIGHT_NODE,
             min,
             max,
             gamma,
+            gain,
             floor
         );
         Self {
             min: min.min(max),
             max: max.max(min + 1),
             gamma,
+            gain,
             floor,
         }
     }
 
     /// 0.0..1.0 (framework brightness) -> raw panel code.
     fn raw(&self, level: f64) -> i64 {
-        let v = level.clamp(0.0, 1.0);
+        let v = (level * self.gain).clamp(0.0, 1.0);
         let curved = if (self.gamma - 1.0).abs() < f64::EPSILON {
             v
         } else {
@@ -117,7 +122,28 @@ fn settings_get(key: &str) -> Option<String> {
 /// `screen_brightness_float` is authoritative; MIUI keeps it in sync even in
 /// auto-brightness mode. `screen_brightness` is only a fallback for older
 /// builds (0..255 or 0..2047).
+fn cmd_display_brightness() -> Option<f64> {
+    // This is the value the ROM brightness slider actually modifies
+    // (DisplayManager.setBrightness -> DisplayPowerController). It does NOT
+    // update Settings.screen_brightness_float on this MIUI build.
+    let out = Command::new("/system/bin/cmd")
+        .args(["display", "get-brightness"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().last()?.trim();
+    let v: f64 = line.parse().ok()?;
+    if v.is_finite() {
+        Some(v.clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
 fn framework_brightness() -> Option<f64> {
+    if let Some(v) = cmd_display_brightness() {
+        return Some(v);
+    }
     if let Some(v) = settings_get("screen_brightness_float") {
         if let Ok(f) = v.parse::<f64>() {
             if f.is_finite() {
@@ -303,8 +329,8 @@ fn usage() -> ! {
     eprintln!(
         "miui_lights {}\n\
          usage:\n\
-           miui_lights [--sync] [--interval MS] [--gamma G] [--floor F]\n\
-           miui_lights --hal [--gamma G] [--floor F]\n\
+           miui_lights [--sync] [--interval MS] [--gamma G] [--gain K] [--floor F]\n\
+           miui_lights --hal [--gamma G] [--gain K] [--floor F]\n\
            miui_lights --probe\n\
            miui_lights --value 0..1 [--gamma G] [--floor F]",
         env!("CARGO_PKG_VERSION")
@@ -323,15 +349,19 @@ fn main() {
         .try_init();
 
     let mut mode = "sync";
-    let mut interval_ms: u64 = 200;
+    let mut interval_ms: u64 = 300;
     let mut gamma: f64 = std::env::var("MIUI_LIGHTS_GAMMA")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1.6);
+        .unwrap_or(1.0);
     let mut floor: f64 = std::env::var("MIUI_LIGHTS_FLOOR")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.01);
+    let mut gain: f64 = std::env::var("MIUI_LIGHTS_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.2);
     let mut value: Option<f64> = None;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -348,15 +378,19 @@ fn main() {
             }
             "--interval" => {
                 i += 1;
-                interval_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(200);
+                interval_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(300);
             }
             "--gamma" => {
                 i += 1;
-                gamma = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1.6);
+                gamma = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1.0);
             }
             "--floor" => {
                 i += 1;
                 floor = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0.01);
+            }
+            "--gain" => {
+                i += 1;
+                gain = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(2.2);
             }
             "-h" | "--help" => usage(),
             other => {
@@ -375,7 +409,7 @@ fn main() {
         return;
     }
 
-    let panel = Panel::detect(gamma, floor);
+    let panel = Panel::detect(gamma, floor, gain);
 
     match mode {
         "hal" => {

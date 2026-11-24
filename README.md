@@ -12,9 +12,11 @@ Hasil probe di device membuktikan lights HAL bawaan **berfungsi** kalau dipanggi
 langsung (`setLightState(0, color)` menulis sysfs dengan benar). Masalahnya cuma
 tidak ada yang memanggil. Karena itu solusinya dua lapis:
 
-1. **`--sync` (default)** — daemon kecil yang membaca
-   `screen_brightness_float` dari Settings dan menulis ke sysfs panel.
-   Ini yang bikin slider brightness langsung berfungsi tanpa menyentuh HAL.
+1. **`--sync` (default)** — daemon kecil yang membaca brightness aktif dari
+   `cmd display get-brightness` (jalur yang dipakai slider ROM:
+   `DisplayManager.setBrightness` → `DisplayPowerController`) lalu menulis ke
+   sysfs panel. Di build MIUI ini slider **tidak** memperbarui
+   `screen_brightness_float`, jadi Settings hanya dipakai sebagai fallback.
 2. **`--hal`** — implementasi ulang `android.hardware.light.ILights/default`
    (AIDL V2) yang menulis sysfs. Dipakai kalau mau mengganti
    `vendor.light-default` bawaan di image.
@@ -56,12 +58,14 @@ Opsi:
 | `--hal` | register `android.hardware.light.ILights/default` | – |
 | `--probe` | baca `getLights()` + tes `setLightState` | – |
 | `--value F` | tulis satu nilai 0.0–1.0 lalu keluar | – |
-| `--interval MS` | interval polling sync | 200 |
-| `--gamma G` | gamma kurva brightness | 1.6 |
+| `--interval MS` | interval polling sync | 300 |
+| `--gamma G` | gamma kurva brightness | 1.0 |
+| `--gain K` | pengali brightness framework (MIUI normal max ~0.45) | 2.2 |
 | `--floor F` | batas minimum fraksi range raw | 0.01 |
 
-Kalau ujung bawah terasa terlalu gelap: `--gamma 1.2` (atau `--gamma 1.0` untuk
-linear). Kalau terlalu terang di minimum: naikkan `--gamma`.
+Kalau ujung bawah terasa terlalu gelap: `--gamma 1.2`. Kalau terlalu terang di
+minimum: naikkan `--gamma`. Kalau brightness maksimum tidak sampai terang
+penuh: naikkan `--gain` (mis. 2.5).
 
 ## Kenapa perlu bridge, bukan cukup hook framework?
 
@@ -69,6 +73,9 @@ Yang sudah dicoba dan hasilnya:
 
 - hook `gui::BpSurfaceComposer::setDisplayBrightness` di system_server →
   `set_calls=0`, framework tidak pernah memanggilnya.
+- slider ROM hanya mengubah `cmd display get-brightness` / `mBrightnessState`,
+  **tidak** menulis `screen_brightness_float` → karena itu bridge membaca nilai
+  dari DisplayManager, bukan dari Settings.
 - `BacklightAdapter` (`useSurfaceControl=false`) → `LightImpl.mColor` tetap 0,
   jadi bukan lewat lights HAL juga.
 - panggil lights HAL langsung (`setLightState(0, 0xC8xxxxxx)`) → sysfs berubah.
