@@ -3,6 +3,12 @@
 service miui-lights /vendor/bin/miui_lights --sync
     class late_start
     user root
-    group root system
-    # optional: tune the curve here
-    #   --gamma 1.6 --interval 200
+    group root system shell
+    # optional: tune the curve here (gamma auto-detected from max_hw_brightness)
+    #   --gamma 1.6 --gain 2.0
+
+on late_start
+    # ROM ini punya dua writer brightness bawaan; hentikan keduanya supaya
+    # tidak rebutan node /sys/class/leds/lcd-backlight/brightness.
+    stop vendor.xiaomi.hardware.milights-service
+    stop vendor.light-default

@@ -12,14 +12,15 @@ Hasil probe di device membuktikan lights HAL bawaan **berfungsi** kalau dipanggi
 langsung (`setLightState(0, color)` menulis sysfs dengan benar). Masalahnya cuma
 tidak ada yang memanggil. Karena itu solusinya dua lapis:
 
-1. **`--sync` (default)** — daemon yang mengikuti brightness realtime dari
-   logcat, yaitu `DisplayManagerService: setTemporaryBrightness ... brightness:`
-   dan `DisplayPowerControllerImpl: ... targetBrightness:` (dipakai slider
-   Control Center, update tiap ~10ms saat drag), plus
-   `DisplayPowerController[0]: BrightnessEvent: brt=` untuk nilai final.
-   Fallback tiap 5 detik: `cmd display get-brightness`. Di build MIUI ini slider
-   **tidak** memperbarui `screen_brightness_float`, jadi Settings hanya fallback
-   terakhir.
+1. **`--sync` (default)** — daemon event-driven berbasis Bionic futex
+   (`__system_property_wait`) yang memantau `debug.tracing.screen_brightness`
+   dan `debug.tracing.screen_state` langsung tanpa `logcat` maupun polling.
+   Saat layar mati (`screen_state` 0/1) backlight dimatikan (`0`) dan update
+   ditahan; saat layar menyala lagi (`screen_state` 2) backlight dipaksa
+   tulis ulang lewat 2 tahap (*state-change level* -> target) agar driver
+   `leds-mtk` tidak melewati nilai yang sama. Saat masuk AOD/DOZE (`1`/`3`/`4`)
+   backlight diturunkan ke `min_hw_brightness`, dan update brightness ditahan
+   sampai layar menyala kembali.
 2. **`--hal`** — implementasi ulang `android.hardware.light.ILights/default`
    (AIDL V2) yang menulis sysfs. Dipakai kalau mau mengganti
    `vendor.light-default` bawaan di image.
@@ -39,6 +40,10 @@ cargo build --target aarch64-linux-android --release
 adb push miui_lights /data/local/tmp/miui_lights
 adb shell chmod 755 /data/local/tmp/miui_lights
 
+# WAJIB: hentikan daemon brightness bawaan ROM. Tanpa ini dua proses
+# rebutan menulis node yang sama dan brightness bisa loncat sendiri.
+adb shell 'stop vendor.xiaomi.hardware.milights-service; stop vendor.light-default'
+
 # 1) bridge brightness (yang dipakai sehari-hari)
 adb shell 'nohup /data/local/tmp/miui_lights --sync >/data/local/tmp/miui_lights.log 2>&1 </dev/null &'
 
@@ -57,18 +62,20 @@ Opsi:
 
 | opsi | arti | default |
 |---|---|---|
-| `--sync` | ikuti `screen_brightness_float` → sysfs | mode default |
+| `--sync` | ikuti `debug.tracing.screen_brightness` + `screen_state` (futex) → sysfs | mode default |
 | `--hal` | register `android.hardware.light.ILights/default` | – |
 | `--probe` | baca `getLights()` + tes `setLightState` | – |
 | `--value F` | tulis satu nilai 0.0–1.0 lalu keluar | – |
-| `--interval MS` | tick idle (mode check; fallback cmd 5 dtk) | 1000 |
-| `--gamma G` | gamma kurva brightness | 1.0 |
+| `--gamma G` | gamma kurva brightness | 1.0 (linear) |
 | `--gain K` | pengali brightness framework (`1/hbmMax` ≈ 2.0) | 2.0 |
-| `--floor F` | batas minimum fraksi range raw | 0.01 |
+| `--floor F` | batas minimum fraksi range raw (hanya saat > 0) | 0.01 |
 
-Kalau ujung bawah terasa terlalu gelap: `--gamma 1.2`. Kalau terlalu terang di
-minimum: naikkan `--gamma`. Kalau brightness maksimum tidak sampai terang
-penuh: naikkan `--gain` (mis. 2.5).
+Kurva default linear. Framework sudah menerapkan kurva perseptualnya sendiri,
+jadi gamma tambahan membuat separuh bawah gelap dan separuh atas loncat terang.
+Dengan `gain=2`, slider 25/50/75/100% memetakan ke ~25/50/75/100% daya panel.
+Kalau ujung bawah masih terasa gelap, turunkan `--gamma` (mis. `0.85`). Kalau
+terlalu terang di minimum, naikkan `--gamma`. Kalau brightness maksimum tidak
+sampai terang penuh: naikkan `--gain` (mis. 2.5).
 
 ## Kenapa perlu bridge, bukan cukup hook framework?
 
@@ -77,9 +84,10 @@ Yang sudah dicoba dan hasilnya:
 - hook `gui::BpSurfaceComposer::setDisplayBrightness` di system_server →
   `set_calls=0`, framework tidak pernah memanggilnya.
 - slider ROM **tidak** menulis `screen_brightness_float` maupun langsung ke
-  HAL. Nilai realtime hanya muncul di log `DisplayPowerController`
-  (`BrightnessEvent: brt=...`), dan `cmd display get-brightness` baru berubah
-  saat slider dilepas → karena itu bridge mengikuti logcat, bukan Settings.
+  HAL. Framework menulis `debug.tracing.screen_brightness` dan
+  `debug.tracing.screen_state`, sehingga bridge memakai kernel futex
+  (`__system_property_wait`) pada dua property tersebut — tidak bergantung pada
+  `logd` atau polling `cmd`.
 - `BacklightAdapter` (`useSurfaceControl=false`) → `LightImpl.mColor` tetap 0,
   jadi bukan lewat lights HAL juga.
 - panggil lights HAL langsung (`setLightState(0, 0xC8xxxxxx)`) → sysfs berubah.
@@ -90,7 +98,7 @@ modul/Xposed), bridge sysfs adalah jalan paling stabil.
 
 ## Auto brightness
 
-`--sync` ikut nilai `screen_brightness_float`. Kalau auto-brightness framework
+`--sync` ikut nilai `debug.tracing.screen_brightness`. Kalau auto-brightness framework
 memang memperbarui nilai itu, bridge otomatis mengikuti. Di device ini auto
 masih mati di level sensor: `mAmbientLux=-1.0` / `0.0 (old/invalid)` dan
 `mAppliedAutoBrightness=false`, karena driver ALS `mn79911` tidak ada di kernel
